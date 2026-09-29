@@ -2,18 +2,18 @@
 # -*- coding: utf-8 -*-
 
 # ==============================================================================
-# 🚀 SHANI VIP — AUTO START (HOSTING MODE)
+# 🚀 SHANI VIP — AUTO START + PROXY ROTATION + DASHBOARD
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# No prompts. Starts instantly with:
-#   Base name : shayan
-#   Threads   : 10
-#   Mode      : UNLIMITED (runs until Ctrl+C)
-# Dashboard   : http://0.0.0.0:8080
-# Rare notify : Telegram (fill bot token + chat id below)
+# • Dashboard at http://0.0.0.0:8080
+# • Paste proxies at http://0.0.0.0:8080/proxies
+# • One proxy per batch (batch size = THREADS)
+# • Cycles back to first proxy after last
+# • Old protobuf self-heals on import
 # ==============================================================================
 
 import os
 import sys
+import re
 import json
 import time
 import random
@@ -33,14 +33,11 @@ import blackboxprotobuf
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
-# ---- protobuf imports with self-heal (fixes old-protobuf hosting envs) ----
+# ---- protobuf imports with self-heal ----
 def _install_protobuf():
-    """Install a protobuf version that has google.protobuf.internal.builder."""
     for cmd in (
-        [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall",
-         "protobuf>=4.25.0"],
-        [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall",
-         "--user", "protobuf>=4.25.0"],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "protobuf>=4.25.0"],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall", "--user", "protobuf>=4.25.0"],
     ):
         try:
             subprocess.run(cmd, check=False)
@@ -63,28 +60,22 @@ except (ImportError, ModuleNotFoundError):
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 try:
-    from flask import Flask, jsonify, send_file, Response
+    from flask import Flask, jsonify, send_file, Response, request
 except ImportError:
     os.system("pip install flask -q")
-    from flask import Flask, jsonify, send_file, Response
+    from flask import Flask, jsonify, send_file, Response, request
 
 # ==============================================================================
 # AUTO-START CONFIG
 # ==============================================================================
 BASE_NAME = "shayan"
 THREADS   = 10
-AMOUNT    = 0        # 0 = unlimited
+AMOUNT    = 0
 REGION    = "PK"
 
-# ==============================================================================
-# TELEGRAM CONFIG  ← fill these in
-# ==============================================================================
 TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID_HERE"
 
-# ==============================================================================
-# DASHBOARD CONFIG
-# ==============================================================================
 DASHBOARD_HOST = "0.0.0.0"
 DASHBOARD_PORT = 8080
 
@@ -96,8 +87,8 @@ URL_TOKEN_GRANT    = "https://100067.connect.garena.com/api/v2/oauth/guest/token
 URL_MAJOR_LOGIN    = "https://loginbp.ppmainecoonghj.com/MajorLogin"
 URL_MAJOR_REGISTER = "https://loginbp.ppmainecoonghj.com/MajorRegister"
 URL_NEWBIE_CHOICE  = "https://loginbp.ppmainecoonghj.com/ChooseNewbieChoice"
-
 URL_SPIN           = "https://clientbp.ggpolarbear.com/PurchaseGacha"
+
 RELEASE_VERSION    = "OB55"
 GAME_VERSION       = "2.132.4"
 
@@ -148,6 +139,7 @@ HEADERS_LOGINBP = {
 SHANI_DIR = "shani"
 RARE_FILE = os.path.join(SHANI_DIR, "rare.json")
 ALL_FILE  = os.path.join(SHANI_DIR, "all.json")
+PROXY_STORE = os.path.join(SHANI_DIR, "proxies.txt")
 
 CLEAR_AFTER = 100
 
@@ -159,6 +151,110 @@ C = {
     "C": "\033[96m", "W": "\033[97m", "M": "\033[95m",
     "RST": "\033[0m", "B": "\033[1m"
 }
+
+# ==============================================================================
+# PROXY POOL
+# ==============================================================================
+_proxy_pool = []          # list of dicts {"http": url, "https": url}
+_proxy_labels = []        # parallel list of sid labels for printing
+_proxy_pool_lock = threading.Lock()
+
+
+def parse_proxy_line(line):
+    """
+    Accepts:
+      socks5://user:pass@host:port
+      socks5://user:pass@[host]:port{tag}anything
+      http://host:port:user:pass
+      host:port:user:pass
+      host:port
+    Returns (proxies_dict, sid_label) or (None, None).
+    """
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None, None
+
+    # strip trailing {xxx}... junk
+    line = re.sub(r"\{[^}]*\}.*$", "", line)
+    # remove ipv6-style brackets around hostname
+    line = line.replace("[", "").replace("]", "")
+
+    # Case A: scheme://user:pass@host:port
+    m = re.match(r"^(socks5h?|socks4|http|https)://([^:@/]+):([^@/]+)@([^:/]+):(\d+)$", line)
+    if m:
+        scheme, user, pwd, host, port = m.groups()
+        url = f"{scheme}://{user}:{pwd}@{host}:{port}"
+        sid = user.split("_sid_")[-1].split("_time")[0] if "_sid_" in user else user[-8:]
+        return {"http": url, "https": url}, sid
+
+    # Case B: scheme://host:port:user:pass
+    m = re.match(r"^(socks5h?|socks4|http|https)://([^:/]+):(\d+):([^:]+):(.+)$", line)
+    if m:
+        scheme, host, port, user, pwd = m.groups()
+        url = f"{scheme}://{user}:{pwd}@{host}:{port}"
+        sid = user.split("_sid_")[-1].split("_time")[0] if "_sid_" in user else user[-8:]
+        return {"http": url, "https": url}, sid
+
+    # Case C: host:port:user:pass (assume socks5 or http — we default to http)
+    parts = line.split(":")
+    if len(parts) == 4:
+        host, port, user, pwd = parts
+        url = f"http://{user}:{pwd}@{host}:{port}"
+        sid = user.split("_sid_")[-1].split("_time")[0] if "_sid_" in user else user[-8:]
+        return {"http": url, "https": url}, sid
+
+    # Case D: host:port (no auth)
+    if len(parts) == 2:
+        url = f"http://{line}"
+        return {"http": url, "https": url}, line[-8:]
+
+    return None, None
+
+
+def set_proxies(raw_text):
+    """Replace the global pool from raw text (one per line)."""
+    global _proxy_pool, _proxy_labels
+    parsed = []
+    labels = []
+    for line in raw_text.splitlines():
+        p, sid = parse_proxy_line(line)
+        if p:
+            parsed.append(p)
+            labels.append(sid)
+    with _proxy_pool_lock:
+        _proxy_pool = parsed
+        _proxy_labels = labels
+    # persist
+    os.makedirs(SHANI_DIR, exist_ok=True)
+    with open(PROXY_STORE, "w", encoding="utf-8") as f:
+        f.write(raw_text)
+    return len(parsed)
+
+
+def load_proxies_from_disk():
+    if not os.path.exists(PROXY_STORE):
+        return 0
+    try:
+        with open(PROXY_STORE, "r", encoding="utf-8") as f:
+            return set_proxies(f.read())
+    except Exception:
+        return 0
+
+
+def get_batch_proxy(batch_num):
+    """Return the proxy dict for a given batch (cycles)."""
+    with _proxy_pool_lock:
+        if not _proxy_pool:
+            return None, None
+        idx = (batch_num - 1) % len(_proxy_pool)
+        return _proxy_pool[idx], _proxy_labels[idx]
+
+
+def get_random_proxy():
+    with _proxy_pool_lock:
+        if not _proxy_pool:
+            return None
+        return random.choice(_proxy_pool)
 
 # ==============================================================================
 # SHANI VIP UI
@@ -300,7 +396,7 @@ CAPTURE_HEX = (
     "635F6D2B6465430E6FD72880AEA2B636D66A27C8C9B58CC0CF6920BCC700021908AC82BEE64501791FAA19717AB863AD"
     "C9C7AA895A3840F49B53527B6E2EB030D788C25E4E9BAEE527EEFC58D99A2A16B8DA2405B43787AA448CBE486657EC64"
     "4AF04B25600B9AF96B6AC807312C03DDDD2E1D0E2DC0CF01E6EC3577990044DBF190A0C16422C7491B7ABD05EE57C5F7"
-    "455FF9FFA0736656369D59B3C1445508F38ABB785E7C521EDF364E3F2AF799DA4643F25844F52E09E3F64AF4B78B1A46"
+    "455FF9FFA0736656369D59B3C1445508F38ABB785E77C521EDF364E3F2AF799DA4643F25844F52E09E3F64AF4B78B1A46"
     "6C56BF89BA0D078A588DD42DCA1C1A7C88619394544721AE22A1F1FA6895FFE79F85AADFFF31215A8D34DFA88089A97A"
     "E1E5B4A5544CE6B6B4EEA1950A9E232F64DDB3683C46DFF24D2709B48971BDA41700CFD8C332054F418A588683493E27"
     "730D5329F0504DEB67B67AC4207E0C229F298868EABD1BE4BC2C1998B59B1D13674C2FAA9AB541B7512B996820FB3DD3"
@@ -367,7 +463,7 @@ def _parse_login_data_response(raw_bytes):
     return proto
 
 # ==============================================================================
-# STATE & LOCKS
+# STATE
 # ==============================================================================
 print_lock = threading.Lock()
 file_lock  = threading.Lock()
@@ -386,10 +482,10 @@ STATE = {
     "last_rare_uid": None,
     "last_rare_item": None,
     "last_rare_at": None,
+    "current_proxy": None,
 }
 STATE_LOCK = threading.Lock()
 
-# ---------- terminal clear helpers ----------
 _printed_since_clear = 0
 _clear_lock = threading.Lock()
 
@@ -400,19 +496,17 @@ def _maybe_clear_screen(batch_num):
         if _printed_since_clear < CLEAR_AFTER:
             return
         _printed_since_clear = 0
-
         os.system("cls" if os.name == "nt" else "clear")
-
         with STATE_LOCK:
             s   = STATE["success"]
             r   = STATE["rare"]
             unl = STATE["unlimited"]
             st  = STATE["start_time"] or time.time()
-
+            prox = STATE["current_proxy"] or "direct"
+            plen = len(_proxy_pool)
         elapsed = time.time() - st
         target_disp  = "∞" if unl else str(STATE["total"])
         created_disp = f"{s}/{target_disp}"
-
         print(f"{C['M']}{C['B']}╔══════════════════════════════════════════════════════════════╗{C['RST']}")
         print(f"{C['M']}{C['B']}║{'⚡ SHANI VIP — RUNNING ⚡'.center(46)}║{C['RST']}")
         print(f"{C['M']}{C['B']}╠══════════════════════════════════════════════════════════════╣{C['RST']}")
@@ -420,7 +514,8 @@ def _maybe_clear_screen(batch_num):
         print(f"{C['M']}{C['B']}║{C['RST']} Created   : {C['G']}{created_disp}{' ' * max(0, 32 - len(created_disp))}{C['RST']}{C['M']}{C['B']}║{C['RST']}")
         print(f"{C['M']}{C['B']}║{C['RST']} Rare      : {C['Y']}{r:<32}{C['RST']}{C['M']}{C['B']}║{C['RST']}")
         print(f"{C['M']}{C['B']}║{C['RST']} Elapsed   : {f'{elapsed:.0f}s':<32}{C['M']}{C['B']}║{C['RST']}")
-        print(f"{C['M']}{C['B']}║{C['RST']} Dashboard : http://127.0.0.1:{DASHBOARD_PORT}{' ' * (32 - len(f'http://127.0.0.1:{DASHBOARD_PORT}'))}{C['M']}{C['B']}║{C['RST']}")
+        print(f"{C['M']}{C['B']}║{C['RST']} Proxy     : {C['C']}{prox:<32}{C['RST']}{C['M']}{C['B']}║{C['RST']}")
+        print(f"{C['M']}{C['B']}║{C['RST']} Pool      : {plen} proxies{C['RST']}")
         print(f"{C['M']}{C['B']}╚══════════════════════════════════════════════════════════════╝{C['RST']}")
         print()
 
@@ -434,32 +529,27 @@ def _send_telegram_rare(uid, password, acc_id, name, rare_hits):
         return
     try:
         lines = [
-            "🌟 *RARE ACCOUNT FOUND* 🌟",
-            "",
+            "🌟 *RARE ACCOUNT FOUND* 🌟", "",
             f"👤 *Name:* `{name}`",
             f"🆔 *UID:* `{uid}`",
             f"🔑 *Password:* `{password}`",
             f"🆔 *Account ID:* `{acc_id}`",
-            "",
-            "🎁 *Rare Items:*",
+            "", "🎁 *Rare Items:*",
         ]
         for e, i, n in rare_hits:
             lines.append(f"  • *{n}*  (ID: `{i}`) — {e}")
-        text = "\n".join(lines)
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": "\n".join(lines), "parse_mode": "Markdown"},
             timeout=10, verify=False
         )
     except Exception:
         pass
 
 def notify_rare_async(uid, password, acc_id, name, rare_hits):
-    threading.Thread(
-        target=_send_telegram_rare,
-        args=(uid, password, acc_id, name, rare_hits),
-        daemon=True
-    ).start()
+    threading.Thread(target=_send_telegram_rare,
+                     args=(uid, password, acc_id, name, rare_hits),
+                     daemon=True).start()
 
 # ==============================================================================
 # WEB DASHBOARD
@@ -467,165 +557,158 @@ def notify_rare_async(uid, password, acc_id, name, rare_hits):
 app = Flask(__name__)
 
 DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SHANI VIP — Dashboard</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: #0a0e1a; color: #e6edf3; min-height: 100vh; padding: 24px;
-  }
-  .container { max-width: 900px; margin: 0 auto; }
-  h1 {
-    font-size: 26px; font-weight: 700; text-align: center; margin-bottom: 6px;
-    background: linear-gradient(90deg, #a855f7, #ec4899, #f59e0b);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-  }
-  .subtitle { text-align: center; color: #8b949e; font-size: 13px; margin-bottom: 24px; }
-  .grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 14px; margin-bottom: 22px;
-  }
-  .card {
-    background: #111827; border: 1px solid #1f2937; border-radius: 12px;
-    padding: 18px; text-align: center; transition: .2s;
-  }
-  .card:hover { border-color: #a855f7; transform: translateY(-2px); }
-  .card .label {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px;
-    color: #8b949e; margin-bottom: 8px;
-  }
-  .card .value { font-size: 26px; font-weight: 700; color: #58a6ff; }
-  .card.green .value { color: #3fb950; }
-  .card.yellow .value { color: #f0c419; }
-  .card.magenta .value { color: #d946ef; }
-  .panel {
-    background: #111827; border: 1px solid #1f2937; border-radius: 12px;
-    padding: 18px; margin-bottom: 22px;
-  }
-  .panel h2 {
-    font-size: 14px; text-transform: uppercase; letter-spacing: 1.2px;
-    color: #8b949e; margin-bottom: 12px;
-  }
-  .row {
-    display: flex; justify-content: space-between; padding: 8px 0;
-    border-bottom: 1px dashed #1f2937; font-size: 14px;
-  }
-  .row:last-child { border-bottom: none; }
-  .row .k { color: #8b949e; }
-  .row .v { color: #e6edf3; font-weight: 600; }
-  .downloads { display: flex; gap: 12px; flex-wrap: wrap; }
-  .btn {
-    flex: 1; min-width: 200px; text-decoration: none; color: #fff; font-weight: 600;
-    padding: 14px 20px; border-radius: 10px; text-align: center;
-    transition: .15s; border: none; font-size: 14px; display: block;
-  }
-  .btn-all  { background: linear-gradient(135deg, #3b82f6, #06b6d4); }
-  .btn-rare { background: linear-gradient(135deg, #a855f7, #ec4899); }
-  .btn:hover { opacity: .88; transform: translateY(-1px); }
-  .status {
-    display: flex; align-items: center; gap: 8px; justify-content: center;
-    margin-top: 22px; color: #8b949e; font-size: 12px;
-  }
-  .dot {
-    width: 8px; height: 8px; border-radius: 50%; background: #3fb950;
-    box-shadow: 0 0 10px #3fb950; animation: pulse 1.6s infinite;
-  }
-  @keyframes pulse { 0%,100% {opacity: 1;} 50% {opacity: .35;} }
-</style>
-</head>
-<body>
-<div class="container">
-  <h1>✦ SHANI VIP DASHBOARD ✦</h1>
-  <div class="subtitle">Live account generator + rare hunt stats</div>
-
-  <div class="grid">
-    <div class="card green">
-      <div class="label">Generated</div>
-      <div class="value" id="success">0</div>
-    </div>
-    <div class="card yellow">
-      <div class="label">Rare Found</div>
-      <div class="value" id="rare">0</div>
-    </div>
-    <div class="card">
-      <div class="label">Batch</div>
-      <div class="value" id="batch">0</div>
-    </div>
-    <div class="card magenta">
-      <div class="label">Elapsed</div>
-      <div class="value" id="elapsed">0s</div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h2>Last Created Account</h2>
-    <div class="row"><span class="k">Name</span><span class="v" id="lc-name">—</span></div>
-    <div class="row"><span class="k">UID</span><span class="v" id="lc-uid">—</span></div>
-    <div class="row"><span class="k">Time</span><span class="v" id="lc-time">—</span></div>
-  </div>
-
-  <div class="panel">
-    <h2>Last Rare Account</h2>
-    <div class="row"><span class="k">Name</span><span class="v" id="lr-name">—</span></div>
-    <div class="row"><span class="k">UID</span><span class="v" id="lr-uid">—</span></div>
-    <div class="row"><span class="k">Item</span><span class="v" id="lr-item">—</span></div>
-    <div class="row"><span class="k">Time</span><span class="v" id="lr-time">—</span></div>
-  </div>
-
-  <div class="panel">
-    <h2>Downloads</h2>
-    <div class="downloads">
-      <a class="btn btn-all" href="/download/all" download>⬇ Download all.json</a>
-      <a class="btn btn-rare" href="/download/rare" download>⬇ Download rare.json</a>
-    </div>
-  </div>
-
-  <div class="status">
-    <span class="dot"></span>
-    <span>Live — refreshes every 2 seconds</span>
-  </div>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+background:#0a0e1a;color:#e6edf3;min-height:100vh;padding:24px}
+.container{max-width:900px;margin:0 auto}
+h1{font-size:26px;font-weight:700;text-align:center;margin-bottom:6px;
+background:linear-gradient(90deg,#a855f7,#ec4899,#f59e0b);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.subtitle{text-align:center;color:#8b949e;font-size:13px;margin-bottom:24px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:22px}
+.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:18px;text-align:center;transition:.2s}
+.card:hover{border-color:#a855f7;transform:translateY(-2px)}
+.card .label{font-size:11px;text-transform:uppercase;letter-spacing:1.2px;color:#8b949e;margin-bottom:8px}
+.card .value{font-size:26px;font-weight:700;color:#58a6ff}
+.card.green .value{color:#3fb950}.card.yellow .value{color:#f0c419}.card.magenta .value{color:#d946ef}
+.panel{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:18px;margin-bottom:22px}
+.panel h2{font-size:14px;text-transform:uppercase;letter-spacing:1.2px;color:#8b949e;margin-bottom:12px}
+.row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px dashed #1f2937;font-size:14px}
+.row:last-child{border-bottom:none}.row .k{color:#8b949e}.row .v{color:#e6edf3;font-weight:600}
+.downloads{display:flex;gap:12px;flex-wrap:wrap}
+.btn{flex:1;min-width:200px;text-decoration:none;color:#fff;font-weight:600;
+padding:14px 20px;border-radius:10px;text-align:center;transition:.15s;font-size:14px;display:block}
+.btn-all{background:linear-gradient(135deg,#3b82f6,#06b6d4)}
+.btn-rare{background:linear-gradient(135deg,#a855f7,#ec4899)}
+.btn-proxy{background:linear-gradient(135deg,#f59e0b,#ef4444);margin-top:12px}
+.btn:hover{opacity:.88;transform:translateY(-1px)}
+.status{display:flex;align-items:center;gap:8px;justify-content:center;margin-top:22px;color:#8b949e;font-size:12px}
+.dot{width:8px;height:8px;border-radius:50%;background:#3fb950;box-shadow:0 0 10px #3fb950;animation:pulse 1.6s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+</style></head><body><div class="container">
+<h1>✦ SHANI VIP DASHBOARD ✦</h1>
+<div class="subtitle">Live account generator + rare hunt stats</div>
+<div class="grid">
+<div class="card green"><div class="label">Generated</div><div class="value" id="success">0</div></div>
+<div class="card yellow"><div class="label">Rare Found</div><div class="value" id="rare">0</div></div>
+<div class="card"><div class="label">Batch</div><div class="value" id="batch">0</div></div>
+<div class="card magenta"><div class="label">Elapsed</div><div class="value" id="elapsed">0s</div></div>
 </div>
-
+<div class="panel"><h2>Current Proxy</h2>
+<div class="row"><span class="k">SID</span><span class="v" id="px">—</span></div>
+<div class="row"><span class="k">Pool size</span><span class="v" id="pool">0</span></div>
+</div>
+<div class="panel"><h2>Last Created Account</h2>
+<div class="row"><span class="k">Name</span><span class="v" id="lc-name">—</span></div>
+<div class="row"><span class="k">UID</span><span class="v" id="lc-uid">—</span></div>
+<div class="row"><span class="k">Time</span><span class="v" id="lc-time">—</span></div>
+</div>
+<div class="panel"><h2>Last Rare Account</h2>
+<div class="row"><span class="k">Name</span><span class="v" id="lr-name">—</span></div>
+<div class="row"><span class="k">UID</span><span class="v" id="lr-uid">—</span></div>
+<div class="row"><span class="k">Item</span><span class="v" id="lr-item">—</span></div>
+<div class="row"><span class="k">Time</span><span class="v" id="lr-time">—</span></div>
+</div>
+<div class="panel"><h2>Downloads &amp; Settings</h2>
+<div class="downloads">
+<a class="btn btn-all" href="/download/all" download>⬇ all.json</a>
+<a class="btn btn-rare" href="/download/rare" download>⬇ rare.json</a>
+</div>
+<a class="btn btn-proxy" href="/proxies">⚙ Manage Proxies</a>
+</div>
+<div class="status"><span class="dot"></span><span>Live — refreshes every 2 seconds</span></div>
+</div>
 <script>
-function fmt(ts) {
-  if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleTimeString();
-}
-function fmtElapsed(sec) {
-  sec = Math.floor(sec || 0);
-  const h = Math.floor(sec / 3600);
-  const m = Math.floor((sec % 3600) / 60);
-  const s = sec % 60;
-  if (h) return h + "h " + m + "m";
-  if (m) return m + "m " + s + "s";
-  return s + "s";
-}
-async function refresh() {
-  try {
-    const r = await fetch("/api/stats");
-    const d = await r.json();
-    document.getElementById("success").textContent  = d.success;
-    document.getElementById("rare").textContent     = d.rare;
-    document.getElementById("batch").textContent    = d.batch_num;
-    document.getElementById("elapsed").textContent  = fmtElapsed(d.elapsed);
-    document.getElementById("lc-name").textContent = d.last_created_name || "—";
-    document.getElementById("lc-uid").textContent  = d.last_created_uid  || "—";
-    document.getElementById("lc-time").textContent = fmt(d.last_created_at);
-    document.getElementById("lr-name").textContent = d.last_rare_name || "—";
-    document.getElementById("lr-uid").textContent  = d.last_rare_uid  || "—";
-    document.getElementById("lr-item").textContent = d.last_rare_item || "—";
-    document.getElementById("lr-time").textContent = fmt(d.last_rare_at);
-  } catch (e) {}
-}
-refresh();
-setInterval(refresh, 2000);
-</script>
-</body>
-</html>
+function fmt(ts){if(!ts)return"—";return new Date(ts*1000).toLocaleTimeString()}
+function fmtElapsed(sec){sec=Math.floor(sec||0);const h=Math.floor(sec/3600);
+const m=Math.floor((sec%3600)/60);const s=sec%60;
+if(h)return h+"h "+m+"m";if(m)return m+"m "+s+"s";return s+"s"}
+async function refresh(){try{
+const r=await fetch("/api/stats");const d=await r.json();
+document.getElementById("success").textContent=d.success;
+document.getElementById("rare").textContent=d.rare;
+document.getElementById("batch").textContent=d.batch_num;
+document.getElementById("elapsed").textContent=fmtElapsed(d.elapsed);
+document.getElementById("px").textContent=d.current_proxy||"direct";
+document.getElementById("pool").textContent=d.pool_size;
+document.getElementById("lc-name").textContent=d.last_created_name||"—";
+document.getElementById("lc-uid").textContent=d.last_created_uid||"—";
+document.getElementById("lc-time").textContent=fmt(d.last_created_at);
+document.getElementById("lr-name").textContent=d.last_rare_name||"—";
+document.getElementById("lr-uid").textContent=d.last_rare_uid||"—";
+document.getElementById("lr-item").textContent=d.last_rare_item||"—";
+document.getElementById("lr-time").textContent=fmt(d.last_rare_at);
+}catch(e){}}
+refresh();setInterval(refresh,2000);
+</script></body></html>
+"""
+
+PROXY_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SHANI VIP — Proxies</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+background:#0a0e1a;color:#e6edf3;min-height:100vh;padding:24px}
+.container{max-width:900px;margin:0 auto}
+h1{font-size:24px;font-weight:700;text-align:center;margin-bottom:6px;
+background:linear-gradient(90deg,#f59e0b,#ef4444);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.subtitle{text-align:center;color:#8b949e;font-size:13px;margin-bottom:24px}
+.panel{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:18px;margin-bottom:22px}
+textarea{width:100%;min-height:280px;background:#0a0e1a;color:#e6edf3;
+border:1px solid #1f2937;border-radius:8px;padding:12px;font-family:ui-monospace,Menlo,monospace;
+font-size:12px;line-height:1.6;resize:vertical}
+textarea:focus{outline:none;border-color:#f59e0b}
+button{background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;font-weight:600;
+border:none;padding:14px 28px;border-radius:10px;font-size:15px;cursor:pointer;margin-top:12px;width:100%}
+button:hover{opacity:.9}
+.status{margin-top:14px;padding:12px;border-radius:8px;font-size:13px;display:none}
+.status.ok{background:#0d2818;color:#3fb950;border:1px solid #1c4d2e;display:block}
+.status.err{background:#2d0d0d;color:#f87171;border:1px solid #4d1c1c;display:block}
+.info{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px;
+font-size:13px;color:#8b949e;margin-bottom:22px;line-height:1.7}
+.info b{color:#e6edf3}
+.back{display:inline-block;color:#8b949e;text-decoration:none;font-size:13px;margin-bottom:16px}
+.back:hover{color:#e6edf3}
+</style></head><body><div class="container">
+<a class="back" href="/">← Back to dashboard</a>
+<h1>⚙ PROXY MANAGER</h1>
+<div class="subtitle">Paste proxies below (one per line) — supports all formats</div>
+<div class="info">
+<b>Supported formats:</b><br>
+&nbsp;&nbsp;socks5://user:pass@host:port<br>
+&nbsp;&nbsp;socks5://user:pass@[host]:port{tag}anything<br>
+&nbsp;&nbsp;http://host:port:user:pass<br>
+&nbsp;&nbsp;host:port:user:pass<br>
+&nbsp;&nbsp;host:port
+</div>
+<div class="panel">
+<form id="f" method="POST" action="/proxies/save">
+<textarea name="raw" id="raw" placeholder="socks5://user:pass@change5.owlproxy.com:7778
+socks5://user:pass@change5.owlproxy.com:7778
+...">{{CURRENT}}</textarea>
+<button type="submit">💾 Save &amp; Reload Pool</button>
+</form>
+<div class="status" id="st"></div>
+</div>
+</div>
+<script>
+const f=document.getElementById("f"),s=document.getElementById("st");
+f.addEventListener("submit",async e=>{e.preventDefault();
+const fd=new FormData(f);
+const r=await fetch("/proxies/save",{method:"POST",body:fd});
+const d=await r.json();
+s.className="status "+(d.ok?"ok":"err");
+s.textContent=d.ok?("✅ Loaded "+d.count+" proxies into pool"):("❌ "+d.error);
+setTimeout(()=>s.className="status",4000);
+});
+</script></body></html>
 """
 
 @app.route("/")
@@ -650,8 +733,31 @@ def dashboard_stats():
             "last_rare_uid": STATE["last_rare_uid"],
             "last_rare_item": STATE["last_rare_item"],
             "last_rare_at": STATE["last_rare_at"],
+            "current_proxy": STATE["current_proxy"],
+            "pool_size": len(_proxy_pool),
         }
     return jsonify(data)
+
+@app.route("/proxies", methods=["GET"])
+def proxies_page():
+    current = ""
+    if os.path.exists(PROXY_STORE):
+        try:
+            with open(PROXY_STORE, "r", encoding="utf-8") as f:
+                current = f.read()
+        except Exception:
+            pass
+    html = PROXY_HTML.replace("{{CURRENT}}", current)
+    return Response(html, mimetype="text/html")
+
+@app.route("/proxies/save", methods=["POST"])
+def proxies_save():
+    raw = request.form.get("raw", "")
+    try:
+        n = set_proxies(raw)
+        return jsonify({"ok": True, "count": n})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/download/all")
 def download_all():
@@ -671,14 +777,13 @@ def start_dashboard():
             app.run(host=DASHBOARD_HOST, port=DASHBOARD_PORT,
                     debug=False, use_reloader=False, threaded=True)
         except Exception as e:
-            print(f"{C['R']}[!] Dashboard failed to start on port {DASHBOARD_PORT}: {e}{C['RST']}")
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+            print(f"{C['R']}[!] Dashboard failed on port {DASHBOARD_PORT}: {e}{C['RST']}")
+    threading.Thread(target=_run, daemon=True).start()
 
 # ==============================================================================
 # PHASE 1 — CREATE
 # ==============================================================================
-def create_guest_account(base_name, region="PK"):
+def create_guest_account(base_name, proxy, region="PK"):
     session = requests.Session()
 
     password = gen_custom_password()
@@ -692,7 +797,7 @@ def create_guest_account(base_name, region="PK"):
         r = session.post(
             URL_GUEST_REGISTER,
             headers={**HEADERS_MSDK, "Authorization": f"Signature {reg_sig}"},
-            data=reg_body, verify=False, timeout=10
+            data=reg_body, proxies=proxy, verify=False, timeout=15
         )
     except Exception:
         return None
@@ -711,7 +816,7 @@ def create_guest_account(base_name, region="PK"):
                 "password": password, "response_type": "token", "uid": int(uid)
             }
             r2 = session.post(URL_TOKEN_GRANT, headers=HEADERS_MSDK,
-                              json=grant_body, verify=False, timeout=10)
+                              json=grant_body, proxies=proxy, verify=False, timeout=15)
             if r2.status_code != 200:
                 time.sleep(1); continue
             gd = r2.json()["data"]
@@ -723,7 +828,7 @@ def create_guest_account(base_name, region="PK"):
             enc_login = enc_aes(blackboxprotobuf.encode_message(
                 _build_login_meta(open_id, access_token), typedef_login))
             session.post(URL_MAJOR_LOGIN, headers=hdr, data=enc_login,
-                         verify=False, timeout=10)
+                         proxies=proxy, verify=False, timeout=15)
 
             account_id = None
             selected_name = None
@@ -741,7 +846,7 @@ def create_guest_account(base_name, region="PK"):
                 }
                 enc_reg = enc_aes(blackboxprotobuf.encode_message(reg_msg, typedef_reg))
                 r4 = session.post(URL_MAJOR_REGISTER, headers=hdr, data=enc_reg,
-                                  verify=False, timeout=10)
+                                  proxies=proxy, verify=False, timeout=15)
                 if r4.status_code != 200:
                     time.sleep(1); continue
                 try:
@@ -769,17 +874,15 @@ def create_guest_account(base_name, region="PK"):
                 URL_NEWBIE_CHOICE, headers=hdr,
                 data=enc_aes(blackboxprotobuf.encode_message(
                     {"1": int(account_id), "2": 2, "3": 3}, typedef_newbie)),
-                verify=False, timeout=10
+                proxies=proxy, verify=False, timeout=15
             )
             if r5.status_code != 200:
                 time.sleep(1); continue
 
             return {
-                "uid": int(uid),
-                "password": password,
+                "uid": int(uid), "password": password,
                 "account_id": int(account_id) if str(account_id).isdigit() else str(account_id),
-                "name": selected_name,
-                "region": region
+                "name": selected_name, "region": region
             }
         except Exception:
             time.sleep(1)
@@ -789,7 +892,7 @@ def create_guest_account(base_name, region="PK"):
 # ==============================================================================
 # PHASE 2 — ACTIVATE
 # ==============================================================================
-def activate_and_get_jwt(uid, password):
+def activate_and_get_jwt(uid, password, proxy):
     out = {"jwt": None, "account_id": None, "name": None, "error": None}
     session = requests.Session()
 
@@ -800,7 +903,7 @@ def activate_and_get_jwt(uid, password):
     }
     try:
         r = session.post(URL_TOKEN_GRANT, headers=HEADERS_MSDK, json=grant_body,
-                         verify=False, timeout=10)
+                         proxies=proxy, verify=False, timeout=15)
     except Exception as e:
         out["error"] = f"Token Grant exception: {e}"; return out
     if r.status_code != 200:
@@ -821,7 +924,7 @@ def activate_and_get_jwt(uid, password):
     try:
         lr = session.post(URL_MAJOR_LOGIN,
                           headers=_base_login_headers(access_token, "loginbp.ppmainecoonghj.com"),
-                          data=enc_login, verify=False, timeout=15)
+                          data=enc_login, proxies=proxy, verify=False, timeout=15)
     except Exception as e:
         out["error"] = f"MajorLogin network: {e}"; return out
     if lr.status_code != 200:
@@ -842,7 +945,7 @@ def activate_and_get_jwt(uid, password):
             host = lp.url.replace("https://", "").replace("http://", "").split("/")[0]
             gld = session.post(f"{lp.url}/GetLoginData",
                                headers=_base_login_headers(lp.token, host),
-                               data=enc_login, verify=False, timeout=15)
+                               data=enc_login, proxies=proxy, verify=False, timeout=15)
             if gld.status_code == 200:
                 out["name"] = _parse_login_data_response(gld.content).AccountName or None
         except Exception:
@@ -898,7 +1001,7 @@ def detect_rare(raw_bytes, decoded):
             return found, RARE_ITEMS[found]
     return None, None
 
-def spin_one(jwt_token, payload_hex):
+def spin_one(jwt_token, payload_hex, proxy):
     headers = {
         "Authorization": f"Bearer {jwt_token}",
         "X-GA": "v1 1",
@@ -908,7 +1011,7 @@ def spin_one(jwt_token, payload_hex):
     }
     try:
         resp = requests.post(URL_SPIN, data=bytes.fromhex(payload_hex),
-                             headers=headers, verify=False, timeout=15)
+                             headers=headers, proxies=proxy, verify=False, timeout=15)
     except Exception as e:
         return {"status": None, "rare": (None, None), "error": str(e)}
     if resp.status_code == 200:
@@ -955,11 +1058,11 @@ def save_normal(entry):
 # ==============================================================================
 # PHASE 2 WORKER
 # ==============================================================================
-def activate_and_spin(acc, idx, batch_num=0):
+def activate_and_spin(acc, idx, proxy, batch_num=0):
     uid      = str(acc["uid"])
     password = acc["password"]
 
-    info = activate_and_get_jwt(uid, password)
+    info = activate_and_get_jwt(uid, password, proxy)
 
     if not info["jwt"]:
         with print_lock:
@@ -973,7 +1076,7 @@ def activate_and_spin(acc, idx, batch_num=0):
     rare_hits    = []
     spin_results = []
     for event_name, payload_hex in PAYLOADS:
-        res = spin_one(jwt, payload_hex)
+        res = spin_one(jwt, payload_hex, proxy)
         item_id, item_name = res["rare"]
         spin_results.append((event_name, item_id, item_name, res["status"]))
         if item_id is not None:
@@ -981,12 +1084,9 @@ def activate_and_spin(acc, idx, batch_num=0):
 
     if rare_hits:
         save_rare({
-            "uid": uid, "password": password,
-            "account_id": acc_id, "name": name,
-            "rare_items": [
-                {"event": e, "item_id": i, "item_name": n}
-                for (e, i, n) in rare_hits
-            ]
+            "uid": uid, "password": password, "account_id": acc_id, "name": name,
+            "rare_items": [{"event": e, "item_id": i, "item_name": n}
+                           for (e, i, n) in rare_hits]
         })
         with STATE_LOCK:
             STATE["rare"] += 1
@@ -994,13 +1094,10 @@ def activate_and_spin(acc, idx, batch_num=0):
             STATE["last_rare_uid"]  = uid
             STATE["last_rare_item"] = ", ".join(n for _, _, n in rare_hits)
             STATE["last_rare_at"]   = time.time()
-
         notify_rare_async(uid, password, acc_id, name, rare_hits)
     else:
-        save_normal({
-            "uid": uid, "password": password,
-            "account_id": acc_id, "name": name
-        })
+        save_normal({"uid": uid, "password": password,
+                     "account_id": acc_id, "name": name})
 
     with print_lock:
         for event_name, item_id, item_name, status in spin_results:
@@ -1008,10 +1105,8 @@ def activate_and_spin(acc, idx, batch_num=0):
                 colors = [C['Y'], C['M'], C['C'], C['G']]
                 for _ in range(2):
                     for color in colors:
-                        sys.stdout.write(
-                            f"\r{color}{C['B']} 👑 [ULTRA RARE DROP!] {item_name} "
-                            f"(ID: {item_id}) | UID: {uid} 👑 {C['RST']}"
-                        )
+                        sys.stdout.write(f"\r{color}{C['B']} 👑 [ULTRA RARE DROP!] "
+                                         f"{item_name} (ID: {item_id}) | UID: {uid} 👑 {C['RST']}")
                         sys.stdout.flush()
                         time.sleep(0.1)
                 print()
@@ -1024,8 +1119,8 @@ def activate_and_spin(acc, idx, batch_num=0):
 
         if rare_hits:
             summary = ", ".join(n for _, _, n in rare_hits)
-            print(f"{C['Y']}{C['B']}[#{idx}] 🌟 RARE uid={uid} "
-                  f"({name}) → {summary} → {RARE_FILE}  📤 TG sent{C['RST']}")
+            print(f"{C['Y']}{C['B']}[#{idx}] 🌟 RARE uid={uid} ({name}) → {summary} "
+                  f"→ {RARE_FILE}  📤 TG sent{C['RST']}")
         else:
             print(f"{C['G']}[#{idx}] ✔ uid={uid} ({name}) → {ALL_FILE}{C['RST']}")
         print()
@@ -1034,7 +1129,7 @@ def activate_and_spin(acc, idx, batch_num=0):
     return True
 
 # ==============================================================================
-# MAIN — AUTO START (no prompts)
+# MAIN — AUTO START
 # ==============================================================================
 def main():
     os.system("cls" if os.name == "nt" else "clear")
@@ -1047,6 +1142,9 @@ def main():
 
     unlimited = STATE["unlimited"]
 
+    # try to load proxies from previous session
+    n_loaded = load_proxies_from_disk()
+
     tg_on = (TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "YOUR_BOT_TOKEN_HERE"
              and TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "YOUR_CHAT_ID_HERE")
 
@@ -1057,12 +1155,18 @@ def main():
     print(f"║ Region    : {REGION:<47}║")
     print(f"║ Target    : {('UNLIMITED' if unlimited else str(AMOUNT)):<47}║")
     print(f"║ Threads   : {THREADS:<47}║")
+    print(f"║ Proxies   : {str(n_loaded) + ' loaded from disk' if n_loaded else 'NONE — direct mode':<47}║")
     print(f"║ Rare file : {RARE_FILE:<47}║")
     print(f"║ All file  : {ALL_FILE:<47}║")
-    print(f"║ Telegram  : {('ON  ✅' if tg_on else 'OFF ❌ (fill TELEGRAM_* at top)'):<47}║")
+    print(f"║ Telegram  : {('ON  ✅' if tg_on else 'OFF ❌'):<47}║")
     print(f"║ Dashboard : http://127.0.0.1:{DASHBOARD_PORT}{' ' * (47 - len(f'http://127.0.0.1:{DASHBOARD_PORT}'))}║")
+    print(f"║ Proxy Mgr : http://127.0.0.1:{DASHBOARD_PORT}/proxies{' ' * (47 - len(f'http://127.0.0.1:{DASHBOARD_PORT}/proxies'))}║")
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
+
+    if not n_loaded:
+        print(f"{C['Y']}[!] No proxies loaded. Open http://<host>:{DASHBOARD_PORT}/proxies to paste them.{C['RST']}")
+        print(f"{C['Y']}    Running in direct mode until proxies are added.{C['RST']}\n")
 
     os.makedirs(SHANI_DIR, exist_ok=True)
     start_dashboard()
@@ -1083,54 +1187,49 @@ def main():
                 break
             batch_size = min(THREADS, remaining)
 
+        # ---- pick proxy for this batch ----
+        proxy, sid = get_batch_proxy(batch_num)
+        with STATE_LOCK:
+            STATE["current_proxy"] = sid if sid else "direct"
+
         target_disp = "∞" if unlimited else str(STATE["total"])
         print(f"{C['M']}{C['B']}━━━ BATCH #{batch_num} — target: {batch_size} accounts "
-              f"({STATE['success']}/{target_disp} done so far) ━━━{C['RST']}\n")
+              f"({STATE['success']}/{target_disp} done) | proxy: {C['C']}{sid or 'direct'}{C['RST']}"
+              f"{C['M']}{C['B']} ━━━{C['RST']}\n")
 
         # ---------- PHASE 1: CREATE ----------
         batch_accounts = []
 
         with ThreadPoolExecutor(max_workers=batch_size) as executor:
             futures = set()
-
             for _ in range(batch_size):
-                futures.add(executor.submit(create_guest_account, BASE_NAME, REGION))
+                futures.add(executor.submit(create_guest_account, BASE_NAME, proxy, REGION))
 
             while len(batch_accounts) < batch_size:
                 while (len(futures) < batch_size and
                        len(batch_accounts) + len(futures) < batch_size):
-                    futures.add(executor.submit(create_guest_account, BASE_NAME, REGION))
-
+                    futures.add(executor.submit(create_guest_account, BASE_NAME, proxy, REGION))
                 if not futures:
                     break
-
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
-
                 for f in done:
                     try:
                         acc = f.result()
                     except Exception:
                         acc = None
-
                     if not acc:
                         continue
-
                     with STATE_LOCK:
                         STATE["success"] += 1
                         current = STATE["success"]
                         STATE["last_created_name"] = acc["name"]
                         STATE["last_created_uid"]  = str(acc["uid"])
                         STATE["last_created_at"]   = time.time()
-
                     batch_accounts.append(acc)
-
                     with print_lock:
                         ShaniVIP.account_box(acc)
-                        print(f"{ShaniVIP.GREEN}[+] Successful Account: "
-                              f"{current}/{target_disp}{ShaniVIP.RESET}")
-
+                        print(f"{ShaniVIP.GREEN}[+] Successful Account: {current}/{target_disp}{ShaniVIP.RESET}")
                     _maybe_clear_screen(batch_num)
-
                     if len(batch_accounts) >= batch_size:
                         break
 
@@ -1139,7 +1238,7 @@ def main():
             print(f"\n{C['C']}[Batch #{batch_num}] Activating + spinning "
                   f"{len(batch_accounts)} accounts...{C['RST']}\n")
             with ThreadPoolExecutor(max_workers=THREADS) as executor:
-                futures = [executor.submit(activate_and_spin, acc, i, batch_num)
+                futures = [executor.submit(activate_and_spin, acc, i, proxy, batch_num)
                            for i, acc in enumerate(batch_accounts, 1)]
                 for f in as_completed(futures):
                     try:
@@ -1164,11 +1263,8 @@ def main():
     print(f"{C['M']}{C['B']}║{C['RST']} Target      : {tgt:<31}{C['M']}{C['B']}║{C['RST']}")
     et = f"{elapsed:.1f}s"
     print(f"{C['M']}{C['B']}║{C['RST']} Time        : {et}{' ' * (31 - len(et))}{C['M']}{C['B']}║{C['RST']}")
-    print(f"{C['M']}{C['B']}║{C['RST']} Rare file   : {RARE_FILE:<31}{C['M']}{C['B']}║{C['RST']}")
-    print(f"{C['M']}{C['B']}║{C['RST']} All file    : {ALL_FILE:<31}{C['M']}{C['B']}║{C['RST']}")
     print(f"{C['M']}{C['B']}╚══════════════════════════════════════════════════════════════╝{C['RST']}")
-    print(f"\n{C['C']}Dashboard still live at http://127.0.0.1:{DASHBOARD_PORT} "
-          f"— press Ctrl+C to exit.{C['RST']}")
+
     try:
         while True:
             time.sleep(3600)
