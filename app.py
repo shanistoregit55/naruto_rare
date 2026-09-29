@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 # ==============================================================================
-# 🚀 SHANI VIP — AUTO START + PROXY ROTATION + DASHBOARD
+# 🚀 SHANI VIP — AUTO START + PROXY ROTATION + STALL WATCHDOG
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# • Dashboard at http://0.0.0.0:8080
-# • Paste proxies at http://0.0.0.0:8080/proxies
+# • Dashboard        : http://0.0.0.0:8080
+# • Proxy Manager    : http://0.0.0.0:8080/proxies
 # • One proxy per batch (batch size = THREADS)
-# • Cycles back to first proxy after last
+# • Auto-rotates proxy if 3 min pass with no successful register
 # • Old protobuf self-heals on import
 # ==============================================================================
 
@@ -89,8 +89,8 @@ URL_MAJOR_REGISTER = "https://loginbp.ppmainecoonghj.com/MajorRegister"
 URL_NEWBIE_CHOICE  = "https://loginbp.ppmainecoonghj.com/ChooseNewbieChoice"
 URL_SPIN           = "https://clientbp.ggpolarbear.com/PurchaseGacha"
 
-RELEASE_VERSION    = "OB55"
-GAME_VERSION       = "2.132.4"
+RELEASE_VERSION = "OB55"
+GAME_VERSION    = "2.132.4"
 
 PAYLOADS = [
     ("Event1", "E5DB1CA2E658D7822AF465B83B4A2D2F"),
@@ -136,12 +136,13 @@ HEADERS_LOGINBP = {
     "X-Unity-Version": "2018.4.12f1"
 }
 
-SHANI_DIR = "shani"
-RARE_FILE = os.path.join(SHANI_DIR, "rare.json")
-ALL_FILE  = os.path.join(SHANI_DIR, "all.json")
+SHANI_DIR   = "shani"
+RARE_FILE   = os.path.join(SHANI_DIR, "rare.json")
+ALL_FILE    = os.path.join(SHANI_DIR, "all.json")
 PROXY_STORE = os.path.join(SHANI_DIR, "proxies.txt")
 
-CLEAR_AFTER = 100
+CLEAR_AFTER   = 100
+STALL_TIMEOUT = 180   # seconds without a successful register → rotate proxy
 
 # ==============================================================================
 # COLORS
@@ -155,9 +156,11 @@ C = {
 # ==============================================================================
 # PROXY POOL
 # ==============================================================================
-_proxy_pool = []          # list of dicts {"http": url, "https": url}
-_proxy_labels = []        # parallel list of sid labels for printing
+_proxy_pool   = []
+_proxy_labels = []
 _proxy_pool_lock = threading.Lock()
+_last_used_proxy_idx = [-1]
+STATE_BATCH_KEY = "_last_batch_for_proxy"
 
 
 def parse_proxy_line(line):
@@ -195,7 +198,7 @@ def parse_proxy_line(line):
         sid = user.split("_sid_")[-1].split("_time")[0] if "_sid_" in user else user[-8:]
         return {"http": url, "https": url}, sid
 
-    # Case C: host:port:user:pass (assume socks5 or http — we default to http)
+    # Case C: host:port:user:pass (default http)
     parts = line.split(":")
     if len(parts) == 4:
         host, port, user, pwd = parts
@@ -213,18 +216,18 @@ def parse_proxy_line(line):
 
 def set_proxies(raw_text):
     """Replace the global pool from raw text (one per line)."""
-    global _proxy_pool, _proxy_labels
-    parsed = []
-    labels = []
+    global _proxy_pool, _proxy_labels, _last_used_proxy_idx
+    parsed, labels = [], []
     for line in raw_text.splitlines():
         p, sid = parse_proxy_line(line)
         if p:
             parsed.append(p)
             labels.append(sid)
     with _proxy_pool_lock:
-        _proxy_pool = parsed
+        _proxy_pool   = parsed
         _proxy_labels = labels
-    # persist
+        _last_used_proxy_idx[0] = -1
+        STATE[STATE_BATCH_KEY] = None
     os.makedirs(SHANI_DIR, exist_ok=True)
     with open(PROXY_STORE, "w", encoding="utf-8") as f:
         f.write(raw_text)
@@ -242,11 +245,29 @@ def load_proxies_from_disk():
 
 
 def get_batch_proxy(batch_num):
-    """Return the proxy dict for a given batch (cycles)."""
+    """
+    Return (proxy_dict, sid_label) for this batch.
+    Cycles through pool. If a rotation was requested by the watchdog,
+    advance one step immediately (even mid-batch).
+    """
+    global _force_proxy_override
     with _proxy_pool_lock:
         if not _proxy_pool:
             return None, None
-        idx = (batch_num - 1) % len(_proxy_pool)
+
+        with _stall_lock:
+            if _force_proxy_override:
+                _last_used_proxy_idx[0] += 1
+                _force_proxy_override = None
+                force_used = True
+            else:
+                force_used = False
+
+        if not force_used and batch_num != STATE.get(STATE_BATCH_KEY):
+            _last_used_proxy_idx[0] += 1
+            STATE[STATE_BATCH_KEY] = batch_num
+
+        idx = _last_used_proxy_idx[0] % len(_proxy_pool)
         return _proxy_pool[idx], _proxy_labels[idx]
 
 
@@ -255,6 +276,53 @@ def get_random_proxy():
         if not _proxy_pool:
             return None
         return random.choice(_proxy_pool)
+
+# ==============================================================================
+# STALL WATCHDOG
+# ==============================================================================
+_last_register_success_ts = time.time()
+_stall_lock = threading.Lock()
+_force_proxy_override = False
+
+
+def mark_register_success():
+    global _last_register_success_ts
+    with _stall_lock:
+        _last_register_success_ts = time.time()
+
+
+def seconds_since_last_success():
+    with _stall_lock:
+        return time.time() - _last_register_success_ts
+
+
+def request_proxy_rotation():
+    global _force_proxy_override
+    with _stall_lock:
+        _force_proxy_override = True
+
+
+def start_stall_watchdog():
+    """
+    Background thread: if no successful registration for STALL_TIMEOUT seconds,
+    force a proxy rotation and log it.
+    """
+    def _loop():
+        last_logged = 0
+        while True:
+            time.sleep(10)
+            secs = seconds_since_last_success()
+            if secs >= STALL_TIMEOUT:
+                if time.time() - last_logged > 30:
+                    last_logged = time.time()
+                    with print_lock:
+                        print(f"{C['Y']}{C['B']}[⚠ STALL] No successful register for "
+                              f"{int(secs)}s — rotating proxy{C['RST']}")
+                request_proxy_rotation()
+                with _stall_lock:
+                    global _last_register_success_ts
+                    _last_register_success_ts = time.time()
+    threading.Thread(target=_loop, daemon=True).start()
 
 # ==============================================================================
 # SHANI VIP UI
@@ -396,7 +464,7 @@ CAPTURE_HEX = (
     "635F6D2B6465430E6FD72880AEA2B636D66A27C8C9B58CC0CF6920BCC700021908AC82BEE64501791FAA19717AB863AD"
     "C9C7AA895A3840F49B53527B6E2EB030D788C25E4E9BAEE527EEFC58D99A2A16B8DA2405B43787AA448CBE486657EC64"
     "4AF04B25600B9AF96B6AC807312C03DDDD2E1D0E2DC0CF01E6EC3577990044DBF190A0C16422C7491B7ABD05EE57C5F7"
-    "455FF9FFA0736656369D59B3C1445508F38ABB785E77C521EDF364E3F2AF799DA4643F25844F52E09E3F64AF4B78B1A46"
+    "455FF9FFA0736656369D59B3C1445508F38ABB785E7C521EDF364E3F2AF799DA4643F25844F52E09E3F64AF4B78B1A46"
     "6C56BF89BA0D078A588DD42DCA1C1A7C88619394544721AE22A1F1FA6895FFE79F85AADFFF31215A8D34DFA88089A97A"
     "E1E5B4A5544CE6B6B4EEA1950A9E232F64DDB3683C46DFF24D2709B48971BDA41700CFD8C332054F418A588683493E27"
     "730D5329F0504DEB67B67AC4207E0C229F298868EABD1BE4BC2C1998B59B1D13674C2FAA9AB541B7512B996820FB3DD3"
@@ -483,6 +551,7 @@ STATE = {
     "last_rare_item": None,
     "last_rare_at": None,
     "current_proxy": None,
+    STATE_BATCH_KEY: None,
 }
 STATE_LOCK = threading.Lock()
 
@@ -807,6 +876,8 @@ def create_guest_account(base_name, proxy, region="PK"):
         uid = r.json()["data"]["uid"]
     except Exception:
         return None
+
+    mark_register_success()  # ✅ register succeeded — reset stall timer
 
     for _ in range(1, 4):
         try:
@@ -1141,8 +1212,6 @@ def main():
         STATE["start_time"] = time.time()
 
     unlimited = STATE["unlimited"]
-
-    # try to load proxies from previous session
     n_loaded = load_proxies_from_disk()
 
     tg_on = (TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "YOUR_BOT_TOKEN_HERE"
@@ -1156,6 +1225,7 @@ def main():
     print(f"║ Target    : {('UNLIMITED' if unlimited else str(AMOUNT)):<47}║")
     print(f"║ Threads   : {THREADS:<47}║")
     print(f"║ Proxies   : {str(n_loaded) + ' loaded from disk' if n_loaded else 'NONE — direct mode':<47}║")
+    print(f"║ Stall W/D : {STALL_TIMEOUT}s (auto-rotate proxy on stall){' ' * (47 - len(str(STALL_TIMEOUT) + 's (auto-rotate proxy on stall)'))}║")
     print(f"║ Rare file : {RARE_FILE:<47}║")
     print(f"║ All file  : {ALL_FILE:<47}║")
     print(f"║ Telegram  : {('ON  ✅' if tg_on else 'OFF ❌'):<47}║")
@@ -1170,6 +1240,7 @@ def main():
 
     os.makedirs(SHANI_DIR, exist_ok=True)
     start_dashboard()
+    start_stall_watchdog()
 
     start = time.time()
     batch_num = 0
@@ -1187,7 +1258,6 @@ def main():
                 break
             batch_size = min(THREADS, remaining)
 
-        # ---- pick proxy for this batch ----
         proxy, sid = get_batch_proxy(batch_num)
         with STATE_LOCK:
             STATE["current_proxy"] = sid if sid else "direct"
@@ -1203,12 +1273,14 @@ def main():
         with ThreadPoolExecutor(max_workers=batch_size) as executor:
             futures = set()
             for _ in range(batch_size):
-                futures.add(executor.submit(create_guest_account, BASE_NAME, proxy, REGION))
+                p_now, _ = get_batch_proxy(batch_num)
+                futures.add(executor.submit(create_guest_account, BASE_NAME, p_now, REGION))
 
             while len(batch_accounts) < batch_size:
                 while (len(futures) < batch_size and
                        len(batch_accounts) + len(futures) < batch_size):
-                    futures.add(executor.submit(create_guest_account, BASE_NAME, proxy, REGION))
+                    p_now, _ = get_batch_proxy(batch_num)
+                    futures.add(executor.submit(create_guest_account, BASE_NAME, p_now, REGION))
                 if not futures:
                     break
                 done, futures = wait(futures, return_when=FIRST_COMPLETED)
@@ -1238,8 +1310,10 @@ def main():
             print(f"\n{C['C']}[Batch #{batch_num}] Activating + spinning "
                   f"{len(batch_accounts)} accounts...{C['RST']}\n")
             with ThreadPoolExecutor(max_workers=THREADS) as executor:
-                futures = [executor.submit(activate_and_spin, acc, i, proxy, batch_num)
-                           for i, acc in enumerate(batch_accounts, 1)]
+                futures = []
+                for i, acc in enumerate(batch_accounts, 1):
+                    p_now, _ = get_batch_proxy(batch_num)
+                    futures.append(executor.submit(activate_and_spin, acc, i, p_now, batch_num))
                 for f in as_completed(futures):
                     try:
                         f.result()
