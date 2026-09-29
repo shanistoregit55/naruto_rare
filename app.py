@@ -22,6 +22,7 @@ import hashlib
 import hmac
 import uuid
 import threading
+import subprocess
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, as_completed
 
@@ -32,9 +33,32 @@ import blackboxprotobuf
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 
-from google.protobuf import descriptor_pool as _descriptor_pool
-from google.protobuf import symbol_database as _symbol_database
-from google.protobuf.internal import builder as _builder
+# ---- protobuf imports with self-heal (fixes old-protobuf hosting envs) ----
+def _install_protobuf():
+    """Install a protobuf version that has google.protobuf.internal.builder."""
+    for cmd in (
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall",
+         "protobuf>=4.25.0"],
+        [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall",
+         "--user", "protobuf>=4.25.0"],
+    ):
+        try:
+            subprocess.run(cmd, check=False)
+        except Exception:
+            pass
+
+try:
+    from google.protobuf import descriptor_pool as _descriptor_pool
+    from google.protobuf import symbol_database as _symbol_database
+    from google.protobuf.internal import builder as _builder
+except (ImportError, ModuleNotFoundError):
+    print("[!] Old protobuf detected — upgrading to protobuf>=4.25.0 ...")
+    _install_protobuf()
+    for _m in [k for k in list(sys.modules.keys()) if k.startswith("google.protobuf")]:
+        del sys.modules[_m]
+    from google.protobuf import descriptor_pool as _descriptor_pool
+    from google.protobuf import symbol_database as _symbol_database
+    from google.protobuf.internal import builder as _builder
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
