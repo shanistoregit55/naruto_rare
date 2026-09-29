@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 
 # ==============================================================================
-# 🚀 SHANI VIP — BATCHED CREATE + ACTIVATE + 4 SPINS + RARE HUNT + TG + DASHBOARD
+# 🚀 SHANI VIP — AUTO START (HOSTING MODE)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Amount = 0  →  UNLIMITED MODE
-# Terminal auto-clears every CLEAR_AFTER successful creations.
-# Rare accounts pushed to Telegram.
-# Web dashboard at http://127.0.0.1:8080  (download all.json + rare.json)
+# No prompts. Starts instantly with:
+#   Base name : shayan
+#   Threads   : 10
+#   Mode      : UNLIMITED (runs until Ctrl+C)
+# Dashboard   : http://0.0.0.0:8080
+# Rare notify : Telegram (fill bot token + chat id below)
 # ==============================================================================
 
 import os
@@ -36,7 +38,6 @@ from google.protobuf.internal import builder as _builder
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Flask import with auto-install fallback
 try:
     from flask import Flask, jsonify, send_file, Response
 except ImportError:
@@ -44,10 +45,18 @@ except ImportError:
     from flask import Flask, jsonify, send_file, Response
 
 # ==============================================================================
+# AUTO-START CONFIG
+# ==============================================================================
+BASE_NAME = "shayan"
+THREADS   = 10
+AMOUNT    = 0        # 0 = unlimited
+REGION    = "PK"
+
+# ==============================================================================
 # TELEGRAM CONFIG  ← fill these in
 # ==============================================================================
-TELEGRAM_BOT_TOKEN = "8699485781:AAE22tup_dayibDxkAylr3YXhmpBoym5uKw"
-TELEGRAM_CHAT_ID   = "7168386586"
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID_HERE"
 
 # ==============================================================================
 # DASHBOARD CONFIG
@@ -141,7 +150,7 @@ class ShaniVIP:
         print(f"{cls.MAGENTA}{cls.BOLD}")
         print("╔══════════════════════════════════════════════════════════════╗")
         print("║                    ✦ SHANI VIP ✦                           ║")
-        print("║           ACCOUNT GENERATOR + AUTO SPINNER                  ║")
+        print("║              AUTO MODE — HOSTING EDITION                    ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print(f"{cls.RESET}")
 
@@ -342,8 +351,8 @@ file_lock  = threading.Lock()
 STATE = {
     "success": 0,
     "rare": 0,
-    "total": 0,
-    "unlimited": False,
+    "total": AMOUNT,
+    "unlimited": (AMOUNT == 0),
     "batch_num": 0,
     "start_time": None,
     "last_created_name": None,
@@ -465,13 +474,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px;
     color: #8b949e; margin-bottom: 8px;
   }
-  .card .value {
-    font-size: 26px; font-weight: 700; color: #58a6ff;
-  }
+  .card .value { font-size: 26px; font-weight: 700; color: #58a6ff; }
   .card.green .value { color: #3fb950; }
   .card.yellow .value { color: #f0c419; }
   .card.magenta .value { color: #d946ef; }
-
   .panel {
     background: #111827; border: 1px solid #1f2937; border-radius: 12px;
     padding: 18px; margin-bottom: 22px;
@@ -487,7 +493,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .row:last-child { border-bottom: none; }
   .row .k { color: #8b949e; }
   .row .v { color: #e6edf3; font-weight: 600; }
-
   .downloads { display: flex; gap: 12px; flex-wrap: wrap; }
   .btn {
     flex: 1; min-width: 200px; text-decoration: none; color: #fff; font-weight: 600;
@@ -583,18 +588,14 @@ async function refresh() {
     document.getElementById("rare").textContent     = d.rare;
     document.getElementById("batch").textContent    = d.batch_num;
     document.getElementById("elapsed").textContent  = fmtElapsed(d.elapsed);
-
     document.getElementById("lc-name").textContent = d.last_created_name || "—";
     document.getElementById("lc-uid").textContent  = d.last_created_uid  || "—";
     document.getElementById("lc-time").textContent = fmt(d.last_created_at);
-
     document.getElementById("lr-name").textContent = d.last_rare_name || "—";
     document.getElementById("lr-uid").textContent  = d.last_rare_uid  || "—";
     document.getElementById("lr-item").textContent = d.last_rare_item || "—";
     document.getElementById("lr-time").textContent = fmt(d.last_rare_at);
-  } catch (e) {
-    /* server briefly busy — keep last values */
-  }
+  } catch (e) {}
 }
 refresh();
 setInterval(refresh, 2000);
@@ -632,15 +633,13 @@ def dashboard_stats():
 def download_all():
     if not os.path.exists(ALL_FILE):
         return Response("File not yet created.", status=404, mimetype="text/plain")
-    return send_file(os.path.abspath(ALL_FILE), as_attachment=True,
-                     download_name="all.json")
+    return send_file(os.path.abspath(ALL_FILE), as_attachment=True, download_name="all.json")
 
 @app.route("/download/rare")
 def download_rare():
     if not os.path.exists(RARE_FILE):
         return Response("File not yet created.", status=404, mimetype="text/plain")
-    return send_file(os.path.abspath(RARE_FILE), as_attachment=True,
-                     download_name="rare.json")
+    return send_file(os.path.abspath(RARE_FILE), as_attachment=True, download_name="rare.json")
 
 def start_dashboard():
     def _run():
@@ -1011,48 +1010,29 @@ def activate_and_spin(acc, idx, batch_num=0):
     return True
 
 # ==============================================================================
-# MAIN
+# MAIN — AUTO START (no prompts)
 # ==============================================================================
 def main():
     os.system("cls" if os.name == "nt" else "clear")
     ShaniVIP.banner()
 
-    base_name = input(f"{C['C']}[?] Base name [default shani]: {C['RST']}").strip() or "shani"
-
-    amount_raw = input(f"{C['C']}[?] Amount to generate (0 = UNLIMITED): {C['RST']}").strip()
-    try:
-        total = int(amount_raw)
-        if total < 0:
-            raise ValueError
-    except Exception:
-        print(f"{C['R']}[!] Invalid amount.{C['RST']}"); return
-
-    unlimited = (total == 0)
-
-    try:
-        threads = int(input(f"{C['C']}[?] Threads [default 10, max 50]: {C['RST']}").strip() or "10")
-    except Exception:
-        threads = 10
-    threads = max(1, min(50, threads))
-
-    region = "PK"
-
     with STATE_LOCK:
-        STATE["total"] = total
-        STATE["unlimited"] = unlimited
+        STATE["total"] = AMOUNT
+        STATE["unlimited"] = (AMOUNT == 0)
         STATE["start_time"] = time.time()
+
+    unlimited = STATE["unlimited"]
 
     tg_on = (TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "YOUR_BOT_TOKEN_HERE"
              and TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "YOUR_CHAT_ID_HERE")
 
-    print()
     print("╔══════════════════════════════════════════════════════════════╗")
-    print("║                       SHANI VIP                             ║")
+    print("║                 SHANI VIP — AUTO START                      ║")
     print("╠══════════════════════════════════════════════════════════════╣")
-    print(f"║ Base Name : {base_name:<47}║")
-    print(f"║ Region    : {region:<47}║")
-    print(f"║ Target    : {('UNLIMITED' if unlimited else str(total)):<47}║")
-    print(f"║ Threads   : {threads:<47}║")
+    print(f"║ Base Name : {BASE_NAME:<47}║")
+    print(f"║ Region    : {REGION:<47}║")
+    print(f"║ Target    : {('UNLIMITED' if unlimited else str(AMOUNT)):<47}║")
+    print(f"║ Threads   : {THREADS:<47}║")
     print(f"║ Rare file : {RARE_FILE:<47}║")
     print(f"║ All file  : {ALL_FILE:<47}║")
     print(f"║ Telegram  : {('ON  ✅' if tg_on else 'OFF ❌ (fill TELEGRAM_* at top)'):<47}║")
@@ -1072,12 +1052,12 @@ def main():
             STATE["batch_num"] = batch_num
 
         if unlimited:
-            batch_size = threads
+            batch_size = THREADS
         else:
             remaining = STATE["total"] - STATE["success"]
             if remaining <= 0:
                 break
-            batch_size = min(threads, remaining)
+            batch_size = min(THREADS, remaining)
 
         target_disp = "∞" if unlimited else str(STATE["total"])
         print(f"{C['M']}{C['B']}━━━ BATCH #{batch_num} — target: {batch_size} accounts "
@@ -1090,12 +1070,12 @@ def main():
             futures = set()
 
             for _ in range(batch_size):
-                futures.add(executor.submit(create_guest_account, base_name, region))
+                futures.add(executor.submit(create_guest_account, BASE_NAME, REGION))
 
             while len(batch_accounts) < batch_size:
                 while (len(futures) < batch_size and
                        len(batch_accounts) + len(futures) < batch_size):
-                    futures.add(executor.submit(create_guest_account, base_name, region))
+                    futures.add(executor.submit(create_guest_account, BASE_NAME, REGION))
 
                 if not futures:
                     break
@@ -1134,7 +1114,7 @@ def main():
         if batch_accounts:
             print(f"\n{C['C']}[Batch #{batch_num}] Activating + spinning "
                   f"{len(batch_accounts)} accounts...{C['RST']}\n")
-            with ThreadPoolExecutor(max_workers=threads) as executor:
+            with ThreadPoolExecutor(max_workers=THREADS) as executor:
                 futures = [executor.submit(activate_and_spin, acc, i, batch_num)
                            for i, acc in enumerate(batch_accounts, 1)]
                 for f in as_completed(futures):
