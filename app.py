@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 
 # ==============================================================================
-# 🚀 SHANI VIP — AUTO START + PROXY ROTATION + STALL WATCHDOG
+# 🚀 SHANI VIP — AUTO START + MULTI-BATCH PROXY MANAGER
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# • Dashboard        : http://0.0.0.0:8080
-# • Proxy Manager    : http://0.0.0.0:8080/proxies
-# • One proxy per batch (batch size = THREADS)
-# • Auto-rotates proxy if 3 min pass with no successful register
-# • Old protobuf self-heals on import
+# • Dashboard     : http://0.0.0.0:8080
+# • Proxy Manager : http://0.0.0.0:8080/proxies  (+ Add New Batch button)
+# • Batch dies    : 3 consecutive PROXY errors (not endpoint errors) → auto-delete
+# • No persistence: batches are memory-only, gone on restart
 # ==============================================================================
 
 import os
@@ -80,6 +79,12 @@ DASHBOARD_HOST = "0.0.0.0"
 DASHBOARD_PORT = 8080
 
 # ==============================================================================
+# DEAD-BATCH DETECTION
+# ==============================================================================
+DEAD_BATCH_THRESHOLD = 3   # 3 consecutive PROXY errors → batch dies
+STALL_TIMEOUT        = 180 # unused now (kept for reference)
+
+# ==============================================================================
 # URLS & CONSTANTS
 # ==============================================================================
 URL_GUEST_REGISTER = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
@@ -136,13 +141,11 @@ HEADERS_LOGINBP = {
     "X-Unity-Version": "2018.4.12f1"
 }
 
-SHANI_DIR   = "shani"
-RARE_FILE   = os.path.join(SHANI_DIR, "rare.json")
-ALL_FILE    = os.path.join(SHANI_DIR, "all.json")
-PROXY_STORE = os.path.join(SHANI_DIR, "proxies.txt")
+SHANI_DIR = "shani"
+RARE_FILE = os.path.join(SHANI_DIR, "rare.json")
+ALL_FILE  = os.path.join(SHANI_DIR, "all.json")
 
-CLEAR_AFTER   = 100
-STALL_TIMEOUT = 180   # seconds without a successful register → rotate proxy
+CLEAR_AFTER = 100
 
 # ==============================================================================
 # COLORS
@@ -154,35 +157,22 @@ C = {
 }
 
 # ==============================================================================
-# PROXY POOL
+# MULTI-BATCH PROXY POOL (in-memory only)
 # ==============================================================================
-_proxy_pool   = []
-_proxy_labels = []
-_proxy_pool_lock = threading.Lock()
-_last_used_proxy_idx = [-1]
-STATE_BATCH_KEY = "_last_batch_for_proxy"
+# batches = [ {"raw": "...", "proxies": [dict,...], "labels": [str,...],
+#              "idx": -1, "dead_streak": 0}, ... ]
+batches = []
+batches_lock = threading.Lock()
+_active_batch_idx = [0]     # index into batches
 
 
 def parse_proxy_line(line):
-    """
-    Accepts:
-      socks5://user:pass@host:port
-      socks5://user:pass@[host]:port{tag}anything
-      http://host:port:user:pass
-      host:port:user:pass
-      host:port
-    Returns (proxies_dict, sid_label) or (None, None).
-    """
     line = line.strip()
     if not line or line.startswith("#"):
         return None, None
-
-    # strip trailing {xxx}... junk
     line = re.sub(r"\{[^}]*\}.*$", "", line)
-    # remove ipv6-style brackets around hostname
     line = line.replace("[", "").replace("]", "")
 
-    # Case A: scheme://user:pass@host:port
     m = re.match(r"^(socks5h?|socks4|http|https)://([^:@/]+):([^@/]+)@([^:/]+):(\d+)$", line)
     if m:
         scheme, user, pwd, host, port = m.groups()
@@ -190,7 +180,6 @@ def parse_proxy_line(line):
         sid = user.split("_sid_")[-1].split("_time")[0] if "_sid_" in user else user[-8:]
         return {"http": url, "https": url}, sid
 
-    # Case B: scheme://host:port:user:pass
     m = re.match(r"^(socks5h?|socks4|http|https)://([^:/]+):(\d+):([^:]+):(.+)$", line)
     if m:
         scheme, host, port, user, pwd = m.groups()
@@ -198,7 +187,6 @@ def parse_proxy_line(line):
         sid = user.split("_sid_")[-1].split("_time")[0] if "_sid_" in user else user[-8:]
         return {"http": url, "https": url}, sid
 
-    # Case C: host:port:user:pass (default http)
     parts = line.split(":")
     if len(parts) == 4:
         host, port, user, pwd = parts
@@ -206,7 +194,6 @@ def parse_proxy_line(line):
         sid = user.split("_sid_")[-1].split("_time")[0] if "_sid_" in user else user[-8:]
         return {"http": url, "https": url}, sid
 
-    # Case D: host:port (no auth)
     if len(parts) == 2:
         url = f"http://{line}"
         return {"http": url, "https": url}, line[-8:]
@@ -214,115 +201,107 @@ def parse_proxy_line(line):
     return None, None
 
 
-def set_proxies(raw_text):
-    """Replace the global pool from raw text (one per line)."""
-    global _proxy_pool, _proxy_labels, _last_used_proxy_idx
-    parsed, labels = [], []
+def _parse_raw_to_batch(raw_text):
+    proxies, labels = [], []
     for line in raw_text.splitlines():
         p, sid = parse_proxy_line(line)
         if p:
-            parsed.append(p)
+            proxies.append(p)
             labels.append(sid)
-    with _proxy_pool_lock:
-        _proxy_pool   = parsed
-        _proxy_labels = labels
-        _last_used_proxy_idx[0] = -1
-        STATE[STATE_BATCH_KEY] = None
-    os.makedirs(SHANI_DIR, exist_ok=True)
-    with open(PROXY_STORE, "w", encoding="utf-8") as f:
-        f.write(raw_text)
-    return len(parsed)
+    return {
+        "raw": raw_text,
+        "proxies": proxies,
+        "labels": labels,
+        "idx": -1,
+        "dead_streak": 0,
+    }
 
 
-def load_proxies_from_disk():
-    if not os.path.exists(PROXY_STORE):
-        return 0
-    try:
-        with open(PROXY_STORE, "r", encoding="utf-8") as f:
-            return set_proxies(f.read())
-    except Exception:
-        return 0
+def add_batch(raw_text):
+    b = _parse_raw_to_batch(raw_text)
+    with batches_lock:
+        batches.append(b)
+        return len(batches) - 1
 
 
-def get_batch_proxy(batch_num):
-    """
-    Return (proxy_dict, sid_label) for this batch.
-    Cycles through pool. If a rotation was requested by the watchdog,
-    advance one step immediately (even mid-batch).
-    """
-    global _force_proxy_override
-    with _proxy_pool_lock:
-        if not _proxy_pool:
-            return None, None
-
-        with _stall_lock:
-            if _force_proxy_override:
-                _last_used_proxy_idx[0] += 1
-                _force_proxy_override = None
-                force_used = True
-            else:
-                force_used = False
-
-        if not force_used and batch_num != STATE.get(STATE_BATCH_KEY):
-            _last_used_proxy_idx[0] += 1
-            STATE[STATE_BATCH_KEY] = batch_num
-
-        idx = _last_used_proxy_idx[0] % len(_proxy_pool)
-        return _proxy_pool[idx], _proxy_labels[idx]
+def update_batch(i, raw_text):
+    b = _parse_raw_to_batch(raw_text)
+    with batches_lock:
+        if 0 <= i < len(batches):
+            batches[i] = b
+            return len(b["proxies"])
+    return 0
 
 
-def get_random_proxy():
-    with _proxy_pool_lock:
-        if not _proxy_pool:
+def delete_batch(i):
+    with batches_lock:
+        if 0 <= i < len(batches):
+            del batches[i]
+            if _active_batch_idx[0] >= len(batches):
+                _active_batch_idx[0] = max(0, len(batches) - 1)
+
+
+def get_active_batch():
+    with batches_lock:
+        if not batches:
             return None
-        return random.choice(_proxy_pool)
-
-# ==============================================================================
-# STALL WATCHDOG
-# ==============================================================================
-_last_register_success_ts = time.time()
-_stall_lock = threading.Lock()
-_force_proxy_override = False
+        if _active_batch_idx[0] >= len(batches):
+            _active_batch_idx[0] = 0
+        return batches[_active_batch_idx[0]]
 
 
-def mark_register_success():
-    global _last_register_success_ts
-    with _stall_lock:
-        _last_register_success_ts = time.time()
+def get_current_proxy():
+    """Round-robin next proxy from active batch. Returns (proxy_dict, sid)."""
+    b = get_active_batch()
+    if not b or not b["proxies"]:
+        return None, None
+    with batches_lock:
+        b["idx"] += 1
+        i = b["idx"] % len(b["proxies"])
+        return b["proxies"][i], b["labels"][i]
 
 
-def seconds_since_last_success():
-    with _stall_lock:
-        return time.time() - _last_register_success_ts
-
-
-def request_proxy_rotation():
-    global _force_proxy_override
-    with _stall_lock:
-        _force_proxy_override = True
-
-
-def start_stall_watchdog():
+def report_proxy_error():
     """
-    Background thread: if no successful registration for STALL_TIMEOUT seconds,
-    force a proxy rotation and log it.
+    Call when a PROXY-side error occurs (ProxyError, ConnectionReset, timeout).
+    NOT called for endpoint-side errors (HTTP 4xx from Garena).
+    Returns True if batch just died.
     """
-    def _loop():
-        last_logged = 0
-        while True:
-            time.sleep(10)
-            secs = seconds_since_last_success()
-            if secs >= STALL_TIMEOUT:
-                if time.time() - last_logged > 30:
-                    last_logged = time.time()
-                    with print_lock:
-                        print(f"{C['Y']}{C['B']}[⚠ STALL] No successful register for "
-                              f"{int(secs)}s — rotating proxy{C['RST']}")
-                request_proxy_rotation()
-                with _stall_lock:
-                    global _last_register_success_ts
-                    _last_register_success_ts = time.time()
-    threading.Thread(target=_loop, daemon=True).start()
+    b = get_active_batch()
+    if not b:
+        return False
+    with batches_lock:
+        b["dead_streak"] += 1
+        if b["dead_streak"] >= DEAD_BATCH_THRESHOLD:
+            idx = _active_batch_idx[0]
+            dead_label = f"Batch {idx + 1}"
+            del batches[idx]
+            if _active_batch_idx[0] >= len(batches):
+                _active_batch_idx[0] = 0
+            new_count = len(batches)
+            new_active = (_active_batch_idx[0] + 1) if new_count > 0 else 0
+            return True, dead_label, new_count, new_active
+    return False
+
+
+def report_proxy_success():
+    """Call when a proxy-side request succeeds — resets the dead streak."""
+    b = get_active_batch()
+    if not b:
+        return
+    with batches_lock:
+        b["dead_streak"] = 0
+
+
+def is_proxy_error(exc):
+    """Return True if the exception is proxy-side, not endpoint-side."""
+    return isinstance(exc, (
+        requests.exceptions.ProxyError,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ConnectTimeout,
+        requests.exceptions.ReadTimeout,
+        requests.exceptions.SSLError,
+    ))
 
 # ==============================================================================
 # SHANI VIP UI
@@ -338,7 +317,7 @@ class ShaniVIP:
         print(f"{cls.MAGENTA}{cls.BOLD}")
         print("╔══════════════════════════════════════════════════════════════╗")
         print("║                    ✦ SHANI VIP ✦                           ║")
-        print("║              AUTO MODE — HOSTING EDITION                    ║")
+        print("║           AUTO MODE — MULTI-BATCH PROXY MANAGER             ║")
         print("╚══════════════════════════════════════════════════════════════╝")
         print(f"{cls.RESET}")
 
@@ -551,7 +530,7 @@ STATE = {
     "last_rare_item": None,
     "last_rare_at": None,
     "current_proxy": None,
-    STATE_BATCH_KEY: None,
+    "current_batch_num": 0,
 }
 STATE_LOCK = threading.Lock()
 
@@ -572,7 +551,9 @@ def _maybe_clear_screen(batch_num):
             unl = STATE["unlimited"]
             st  = STATE["start_time"] or time.time()
             prox = STATE["current_proxy"] or "direct"
-            plen = len(_proxy_pool)
+            cb = STATE["current_batch_num"]
+        with batches_lock:
+            bcount = len(batches)
         elapsed = time.time() - st
         target_disp  = "∞" if unl else str(STATE["total"])
         created_disp = f"{s}/{target_disp}"
@@ -584,7 +565,7 @@ def _maybe_clear_screen(batch_num):
         print(f"{C['M']}{C['B']}║{C['RST']} Rare      : {C['Y']}{r:<32}{C['RST']}{C['M']}{C['B']}║{C['RST']}")
         print(f"{C['M']}{C['B']}║{C['RST']} Elapsed   : {f'{elapsed:.0f}s':<32}{C['M']}{C['B']}║{C['RST']}")
         print(f"{C['M']}{C['B']}║{C['RST']} Proxy     : {C['C']}{prox:<32}{C['RST']}{C['M']}{C['B']}║{C['RST']}")
-        print(f"{C['M']}{C['B']}║{C['RST']} Pool      : {plen} proxies{C['RST']}")
+        print(f"{C['M']}{C['B']}║{C['RST']} Pool      : batch {cb+1}/{bcount}{C['RST']}")
         print(f"{C['M']}{C['B']}╚══════════════════════════════════════════════════════════════╝{C['RST']}")
         print()
 
@@ -669,7 +650,8 @@ padding:14px 20px;border-radius:10px;text-align:center;transition:.15s;font-size
 </div>
 <div class="panel"><h2>Current Proxy</h2>
 <div class="row"><span class="k">SID</span><span class="v" id="px">—</span></div>
-<div class="row"><span class="k">Pool size</span><span class="v" id="pool">0</span></div>
+<div class="row"><span class="k">Active pool</span><span class="v" id="cb">Batch 0</span></div>
+<div class="row"><span class="k">Total pools</span><span class="v" id="pool">0</span></div>
 </div>
 <div class="panel"><h2>Last Created Account</h2>
 <div class="row"><span class="k">Name</span><span class="v" id="lc-name">—</span></div>
@@ -704,6 +686,7 @@ document.getElementById("batch").textContent=d.batch_num;
 document.getElementById("elapsed").textContent=fmtElapsed(d.elapsed);
 document.getElementById("px").textContent=d.current_proxy||"direct";
 document.getElementById("pool").textContent=d.pool_size;
+document.getElementById("cb").textContent="Batch "+(d.current_batch_num+1);
 document.getElementById("lc-name").textContent=d.last_created_name||"—";
 document.getElementById("lc-uid").textContent=d.last_created_uid||"—";
 document.getElementById("lc-time").textContent=fmt(d.last_created_at);
@@ -729,56 +712,108 @@ h1{font-size:24px;font-weight:700;text-align:center;margin-bottom:6px;
 background:linear-gradient(90deg,#f59e0b,#ef4444);
 -webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .subtitle{text-align:center;color:#8b949e;font-size:13px;margin-bottom:24px}
-.panel{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:18px;margin-bottom:22px}
-textarea{width:100%;min-height:280px;background:#0a0e1a;color:#e6edf3;
+.back{display:inline-block;color:#8b949e;text-decoration:none;font-size:13px;margin-bottom:16px}
+.back:hover{color:#e6edf3}
+.batch{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:18px;margin-bottom:18px}
+.batch.active{border-color:#3fb950;box-shadow:0 0 0 1px #3fb95033}
+.batch h3{font-size:14px;color:#e6edf3;margin-bottom:4px;display:flex;justify-content:space-between;align-items:center}
+.badge{font-size:11px;padding:3px 8px;border-radius:20px;font-weight:600;letter-spacing:.5px}
+.badge-active{background:#0d2818;color:#3fb950;border:1px solid #1c4d2e}
+.badge-queued{background:#1f2937;color:#8b949e}
+.badge-count{background:#0c1e2e;color:#58a6ff;border:1px solid #1e3a5f;margin-left:8px}
+textarea{width:100%;min-height:140px;background:#0a0e1a;color:#e6edf3;
 border:1px solid #1f2937;border-radius:8px;padding:12px;font-family:ui-monospace,Menlo,monospace;
-font-size:12px;line-height:1.6;resize:vertical}
+font-size:12px;line-height:1.6;resize:vertical;margin-top:10px}
 textarea:focus{outline:none;border-color:#f59e0b}
-button{background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;font-weight:600;
-border:none;padding:14px 28px;border-radius:10px;font-size:15px;cursor:pointer;margin-top:12px;width:100%}
-button:hover{opacity:.9}
+.actions{display:flex;gap:10px;margin-top:12px}
+.btn-save{background:linear-gradient(135deg,#3b82f6,#06b6d4);color:#fff;font-weight:600;
+border:none;padding:10px 20px;border-radius:8px;font-size:13px;cursor:pointer;flex:1}
+.btn-del{background:#2d0d0d;color:#f87171;border:1px solid #4d1c1c;
+padding:10px 20px;border-radius:8px;font-size:13px;cursor:pointer;font-weight:600}
+.btn-save:hover{opacity:.9}.btn-del:hover{background:#3d0d0d}
+.btn-add{background:linear-gradient(135deg,#f59e0b,#ef4444);color:#fff;font-weight:600;
+border:none;padding:14px 28px;border-radius:10px;font-size:15px;cursor:pointer;width:100%;margin-top:12px}
+.btn-add:hover{opacity:.9}
 .status{margin-top:14px;padding:12px;border-radius:8px;font-size:13px;display:none}
 .status.ok{background:#0d2818;color:#3fb950;border:1px solid #1c4d2e;display:block}
 .status.err{background:#2d0d0d;color:#f87171;border:1px solid #4d1c1c;display:block}
 .info{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px;
 font-size:13px;color:#8b949e;margin-bottom:22px;line-height:1.7}
 .info b{color:#e6edf3}
-.back{display:inline-block;color:#8b949e;text-decoration:none;font-size:13px;margin-bottom:16px}
-.back:hover{color:#e6edf3}
 </style></head><body><div class="container">
 <a class="back" href="/">← Back to dashboard</a>
-<h1>⚙ PROXY MANAGER</h1>
-<div class="subtitle">Paste proxies below (one per line) — supports all formats</div>
+<h1>⚙ PROXY BATCHES</h1>
+<div class="subtitle">Batch 1 is active. When it dies, it's deleted and Batch 2 becomes active.</div>
 <div class="info">
-<b>Supported formats:</b><br>
-&nbsp;&nbsp;socks5://user:pass@host:port<br>
-&nbsp;&nbsp;socks5://user:pass@[host]:port{tag}anything<br>
-&nbsp;&nbsp;http://host:port:user:pass<br>
-&nbsp;&nbsp;host:port:user:pass<br>
-&nbsp;&nbsp;host:port
+<b>Dead-batch rule:</b> 3 consecutive PROXY errors (connection reset / timeout / proxy refused) kills the batch. Endpoint errors (HTTP 4xx from Garena) are ignored.
 </div>
-<div class="panel">
-<form id="f" method="POST" action="/proxies/save">
-<textarea name="raw" id="raw" placeholder="socks5://user:pass@change5.owlproxy.com:7778
-socks5://user:pass@change5.owlproxy.com:7778
-...">{{CURRENT}}</textarea>
-<button type="submit">💾 Save &amp; Reload Pool</button>
+<div id="batches">{{BATCHES}}</div>
+<form id="addform" method="POST" action="/proxies/batch/add">
+<button class="btn-add" type="submit">+ Add New Batch</button>
 </form>
 <div class="status" id="st"></div>
 </div>
-</div>
 <script>
-const f=document.getElementById("f"),s=document.getElementById("st");
-f.addEventListener("submit",async e=>{e.preventDefault();
-const fd=new FormData(f);
-const r=await fetch("/proxies/save",{method:"POST",body:fd});
-const d=await r.json();
-s.className="status "+(d.ok?"ok":"err");
-s.textContent=d.ok?("✅ Loaded "+d.count+" proxies into pool"):("❌ "+d.error);
-setTimeout(()=>s.className="status",4000);
+document.querySelectorAll("form.saveform").forEach(f=>{
+  f.addEventListener("submit",async e=>{
+    e.preventDefault();
+    const idx=f.dataset.idx;
+    const ta=f.querySelector("textarea");
+    const fd=new FormData();fd.append("idx",idx);fd.append("raw",ta.value);
+    const r=await fetch("/proxies/batch/save",{method:"POST",body:fd});
+    const d=await r.json();
+    showStatus(d.ok?"✅ Batch "+(parseInt(idx)+1)+": "+d.count+" proxies saved":("❌ "+d.error));
+    setTimeout(()=>location.reload(),900);
+  });
 });
+async function delBatch(idx){
+  if(!confirm("Delete Batch "+(idx+1)+"?"))return;
+  const fd=new FormData();fd.append("idx",idx);
+  const r=await fetch("/proxies/batch/delete",{method:"POST",body:fd});
+  const d=await r.json();
+  showStatus(d.ok?"🗑 Batch deleted":"❌ "+d.error);
+  setTimeout(()=>location.reload(),700);
+}
+function showStatus(msg){
+  const s=document.getElementById("st");
+  s.className="status ok";s.textContent=msg;
+  setTimeout(()=>s.className="status",2500);
+}
 </script></body></html>
 """
+
+
+def _render_batch_html():
+    with batches_lock:
+        snapshot = list(batches)
+        active = _active_batch_idx[0]
+
+    if not snapshot:
+        return '<div class="batch"><h3>No batches yet — click "+ Add New Batch" below</h3></div>'
+
+    parts = []
+    for i, b in enumerate(snapshot):
+        is_active = (i == active)
+        badge = ('<span class="badge badge-active">ACTIVE</span>'
+                 if is_active else '<span class="badge badge-queued">QUEUED</span>')
+        cnt = f'<span class="badge badge-count">{len(b["proxies"])} proxies</span>'
+        raw_html = (b["raw"]
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;"))
+        parts.append(f"""
+<div class="batch {'active' if is_active else ''}">
+  <h3>Batch {i+1} {badge}{cnt}</h3>
+  <form class="saveform" data-idx="{i}">
+    <textarea name="raw">{raw_html}</textarea>
+    <div class="actions">
+      <button class="btn-save" type="submit">💾 Save</button>
+      <button class="btn-del" type="button" onclick="delBatch({i})">🗑 Delete</button>
+    </div>
+  </form>
+</div>""")
+    return "".join(parts)
+
 
 @app.route("/")
 def dashboard_index():
@@ -803,28 +838,37 @@ def dashboard_stats():
             "last_rare_item": STATE["last_rare_item"],
             "last_rare_at": STATE["last_rare_at"],
             "current_proxy": STATE["current_proxy"],
-            "pool_size": len(_proxy_pool),
+            "pool_size": len(batches),
+            "current_batch_num": STATE["current_batch_num"],
         }
     return jsonify(data)
 
 @app.route("/proxies", methods=["GET"])
 def proxies_page():
-    current = ""
-    if os.path.exists(PROXY_STORE):
-        try:
-            with open(PROXY_STORE, "r", encoding="utf-8") as f:
-                current = f.read()
-        except Exception:
-            pass
-    html = PROXY_HTML.replace("{{CURRENT}}", current)
+    html = PROXY_HTML.replace("{{BATCHES}}", _render_batch_html())
     return Response(html, mimetype="text/html")
 
-@app.route("/proxies/save", methods=["POST"])
-def proxies_save():
-    raw = request.form.get("raw", "")
+@app.route("/proxies/batch/add", methods=["POST"])
+def proxies_batch_add():
+    idx = add_batch("")   # empty batch, user pastes + saves
+    return jsonify({"ok": True, "index": idx})
+
+@app.route("/proxies/batch/save", methods=["POST"])
+def proxies_batch_save():
     try:
-        n = set_proxies(raw)
+        idx = int(request.form.get("idx", "-1"))
+        raw = request.form.get("raw", "")
+        n = update_batch(idx, raw)
         return jsonify({"ok": True, "count": n})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+@app.route("/proxies/batch/delete", methods=["POST"])
+def proxies_batch_delete():
+    try:
+        idx = int(request.form.get("idx", "-1"))
+        delete_batch(idx)
+        return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
@@ -868,16 +912,20 @@ def create_guest_account(base_name, proxy, region="PK"):
             headers={**HEADERS_MSDK, "Authorization": f"Signature {reg_sig}"},
             data=reg_body, proxies=proxy, verify=False, timeout=15
         )
-    except Exception:
+        report_proxy_success()
+    except Exception as e:
+        if is_proxy_error(e):
+            died = report_proxy_error()
+            if died:
+                _log_batch_death(died)
         return None
+
     if r.status_code != 200:
         return None
     try:
         uid = r.json()["data"]["uid"]
     except Exception:
         return None
-
-    mark_register_success()  # ✅ register succeeded — reset stall timer
 
     for _ in range(1, 4):
         try:
@@ -955,10 +1003,26 @@ def create_guest_account(base_name, proxy, region="PK"):
                 "account_id": int(account_id) if str(account_id).isdigit() else str(account_id),
                 "name": selected_name, "region": region
             }
-        except Exception:
+        except Exception as e:
+            if is_proxy_error(e):
+                died = report_proxy_error()
+                if died:
+                    _log_batch_death(died)
             time.sleep(1)
             continue
     return None
+
+
+def _log_batch_death(info):
+    """info = (True, dead_label, remaining_batches, new_active_idx)"""
+    _, dead_label, remaining, new_idx = info
+    with print_lock:
+        if remaining > 0:
+            print(f"\n{C['R']}{C['B']}[💀 BATCH DEAD] {dead_label} deleted. "
+                  f"Switched to Batch {new_idx+1}. ({remaining} batches left){C['RST']}\n")
+        else:
+            print(f"\n{C['R']}{C['B']}[💀 BATCH DEAD] {dead_label} deleted. "
+                  f"No batches remaining — running direct mode.{C['RST']}\n")
 
 # ==============================================================================
 # PHASE 2 — ACTIVATE
@@ -976,6 +1040,9 @@ def activate_and_get_jwt(uid, password, proxy):
         r = session.post(URL_TOKEN_GRANT, headers=HEADERS_MSDK, json=grant_body,
                          proxies=proxy, verify=False, timeout=15)
     except Exception as e:
+        if is_proxy_error(e):
+            died = report_proxy_error()
+            if died: _log_batch_death(died)
         out["error"] = f"Token Grant exception: {e}"; return out
     if r.status_code != 200:
         out["error"] = f"Token Grant HTTP {r.status_code}"; return out
@@ -997,6 +1064,9 @@ def activate_and_get_jwt(uid, password, proxy):
                           headers=_base_login_headers(access_token, "loginbp.ppmainecoonghj.com"),
                           data=enc_login, proxies=proxy, verify=False, timeout=15)
     except Exception as e:
+        if is_proxy_error(e):
+            died = report_proxy_error()
+            if died: _log_batch_death(died)
         out["error"] = f"MajorLogin network: {e}"; return out
     if lr.status_code != 200:
         out["error"] = f"MajorLogin HTTP {lr.status_code}"; return out
@@ -1084,6 +1154,9 @@ def spin_one(jwt_token, payload_hex, proxy):
         resp = requests.post(URL_SPIN, data=bytes.fromhex(payload_hex),
                              headers=headers, proxies=proxy, verify=False, timeout=15)
     except Exception as e:
+        if is_proxy_error(e):
+            died = report_proxy_error()
+            if died: _log_batch_death(died)
         return {"status": None, "rare": (None, None), "error": str(e)}
     if resp.status_code == 200:
         raw = resp.content
@@ -1212,7 +1285,6 @@ def main():
         STATE["start_time"] = time.time()
 
     unlimited = STATE["unlimited"]
-    n_loaded = load_proxies_from_disk()
 
     tg_on = (TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_TOKEN != "YOUR_BOT_TOKEN_HERE"
              and TELEGRAM_CHAT_ID and TELEGRAM_CHAT_ID != "YOUR_CHAT_ID_HERE")
@@ -1224,8 +1296,8 @@ def main():
     print(f"║ Region    : {REGION:<47}║")
     print(f"║ Target    : {('UNLIMITED' if unlimited else str(AMOUNT)):<47}║")
     print(f"║ Threads   : {THREADS:<47}║")
-    print(f"║ Proxies   : {str(n_loaded) + ' loaded from disk' if n_loaded else 'NONE — direct mode':<47}║")
-    print(f"║ Stall W/D : {STALL_TIMEOUT}s (auto-rotate proxy on stall){' ' * (47 - len(str(STALL_TIMEOUT) + 's (auto-rotate proxy on stall)'))}║")
+    print(f"║ Proxies   : paste via /proxies (in-memory, not persisted){' ' * 2}║")
+    print(f"║ Dead rule : {DEAD_BATCH_THRESHOLD} consecutive PROXY errors kill a batch{' ' * (47 - len(str(DEAD_BATCH_THRESHOLD) + ' consecutive PROXY errors kill a batch'))}║")
     print(f"║ Rare file : {RARE_FILE:<47}║")
     print(f"║ All file  : {ALL_FILE:<47}║")
     print(f"║ Telegram  : {('ON  ✅' if tg_on else 'OFF ❌'):<47}║")
@@ -1234,13 +1306,12 @@ def main():
     print("╚══════════════════════════════════════════════════════════════╝")
     print()
 
-    if not n_loaded:
-        print(f"{C['Y']}[!] No proxies loaded. Open http://<host>:{DASHBOARD_PORT}/proxies to paste them.{C['RST']}")
-        print(f"{C['Y']}    Running in direct mode until proxies are added.{C['RST']}\n")
+    print(f"{C['Y']}[!] No proxies yet. Open http://<host>:{DASHBOARD_PORT}/proxies "
+          f"and add your first batch.{C['RST']}")
+    print(f"{C['Y']}    Running in direct mode until proxies are added.{C['RST']}\n")
 
     os.makedirs(SHANI_DIR, exist_ok=True)
     start_dashboard()
-    start_stall_watchdog()
 
     start = time.time()
     batch_num = 0
@@ -1258,14 +1329,17 @@ def main():
                 break
             batch_size = min(THREADS, remaining)
 
-        proxy, sid = get_batch_proxy(batch_num)
+        # current proxy info for logs
+        b = get_active_batch()
+        with batches_lock:
+            bcount = len(batches)
+            abi = _active_batch_idx[0]
         with STATE_LOCK:
-            STATE["current_proxy"] = sid if sid else "direct"
+            STATE["current_batch_num"] = abi
 
         target_disp = "∞" if unlimited else str(STATE["total"])
         print(f"{C['M']}{C['B']}━━━ BATCH #{batch_num} — target: {batch_size} accounts "
-              f"({STATE['success']}/{target_disp} done) | proxy: {C['C']}{sid or 'direct'}{C['RST']}"
-              f"{C['M']}{C['B']} ━━━{C['RST']}\n")
+              f"({STATE['success']}/{target_disp} done) | pool: {abi+1}/{bcount} ━━━{C['RST']}\n")
 
         # ---------- PHASE 1: CREATE ----------
         batch_accounts = []
@@ -1273,13 +1347,17 @@ def main():
         with ThreadPoolExecutor(max_workers=batch_size) as executor:
             futures = set()
             for _ in range(batch_size):
-                p_now, _ = get_batch_proxy(batch_num)
+                p_now, sid = get_current_proxy()
+                with STATE_LOCK:
+                    STATE["current_proxy"] = sid if sid else "direct"
                 futures.add(executor.submit(create_guest_account, BASE_NAME, p_now, REGION))
 
             while len(batch_accounts) < batch_size:
                 while (len(futures) < batch_size and
                        len(batch_accounts) + len(futures) < batch_size):
-                    p_now, _ = get_batch_proxy(batch_num)
+                    p_now, sid = get_current_proxy()
+                    with STATE_LOCK:
+                        STATE["current_proxy"] = sid if sid else "direct"
                     futures.add(executor.submit(create_guest_account, BASE_NAME, p_now, REGION))
                 if not futures:
                     break
@@ -1312,7 +1390,9 @@ def main():
             with ThreadPoolExecutor(max_workers=THREADS) as executor:
                 futures = []
                 for i, acc in enumerate(batch_accounts, 1):
-                    p_now, _ = get_batch_proxy(batch_num)
+                    p_now, sid = get_current_proxy()
+                    with STATE_LOCK:
+                        STATE["current_proxy"] = sid if sid else "direct"
                     futures.append(executor.submit(activate_and_spin, acc, i, p_now, batch_num))
                 for f in as_completed(futures):
                     try:
