@@ -65,11 +65,11 @@ except ImportError:
 # AUTO-START CONFIG
 # ==============================================================================
 BASE_NAME = "shayan"
-THREADS   = 10
+THREADS   = 20
 AMOUNT    = 0
 REGION    = "PK"
 
-TELEGRAM_BOT_TOKEN = "8699485781:AAE22tup_dayibDxkAylr3YXhmpBoym5uKw"
+TELEGRAM_BOT_TOKEN = "8735646077:AAHmILRNuAsGR6UlR6WmhEnH5OrAf0vHA8g"
 TELEGRAM_CHAT_ID   = "7168386586"
 
 DASHBOARD_HOST = "0.0.0.0"
